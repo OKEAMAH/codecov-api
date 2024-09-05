@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from django.conf import settings
 from django.contrib.auth import login, logout
 from django.contrib.sessions.models import Session as DjangoSession
-from django.core.exceptions import PermissionDenied, SuspiciousOperation
+from django.core.exceptions import PermissionDenied
 from django.http.request import HttpRequest
 from django.http.response import HttpResponse
 from django.utils import timezone
@@ -61,7 +61,7 @@ class StateMixin(object):
 
     def __init__(self, *args, **kwargs):
         self.redis = get_redis_connection()
-        return super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
 
     def _session_key(self) -> str:
         return f"{self.service}_oauth_state"
@@ -262,9 +262,7 @@ class LoginMixin(object):
         ]
 
         self._check_enterprise_organizations_membership(user_dict, formatted_orgs)
-        upserted_orgs = []
-        for org in formatted_orgs:
-            upserted_orgs.append(self.get_or_create_org(org))
+        upserted_orgs = [self.get_or_create_org(org) for org in formatted_orgs]
 
         self._check_user_count_limitations(user_dict["user"])
         owner, is_new_user = self._get_or_create_owner(user_dict, request)

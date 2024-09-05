@@ -67,6 +67,7 @@ def resolve_sync_providers(_, info) -> List[str]:
 
 
 @config_bindable.field("planAutoActivate")
+@sync_to_async
 def resolve_plan_auto_activate(_, info: GraphQLResolveInfo) -> Optional[bool]:
     if not settings.IS_ENTERPRISE:
         return None
@@ -108,7 +109,7 @@ def resolve_self_hosted_license(_, info):
     license = self_hosted.get_current_license()
 
     if not license.is_valid:
-        None
+        return None
 
     return license
 

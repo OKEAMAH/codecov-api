@@ -1,14 +1,15 @@
 import json
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 from ariadne import ObjectType, make_executable_schema
 from ariadne.validation import cost_directive
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import ResolverMatch
+from prometheus_client import REGISTRY
 
 from codecov.commands.exceptions import Unauthorized
 
-from ..views import AsyncGraphqlView
+from ..views import AsyncGraphqlView, QueryMetricsExtension
 from .helper import GraphQLTestHelper
 
 
@@ -38,7 +39,7 @@ def generate_cost_test_schema():
     return make_executable_schema([types, cost_directive], query_bindable)
 
 
-class ArianeViewTestCase(GraphQLTestHelper, TestCase):
+class AriadneViewTestCase(GraphQLTestHelper, TestCase):
     async def do_query(self, schema, query="{ failing }"):
         view = AsyncGraphqlView.as_view(schema=schema)
         request = RequestFactory().post(
@@ -53,12 +54,46 @@ class ArianeViewTestCase(GraphQLTestHelper, TestCase):
         return json.loads(res.content)
 
     @override_settings(DEBUG=True)
-    async def test_when_debug_is_true(self):
+    @patch("logging.Logger.info")
+    async def test_when_debug_is_true(self, patched_log):
+        before = REGISTRY.get_sample_value(
+            "api_gql_counts_hits_total",
+            labels={"operation_type": "unknown_type", "operation_name": "unknown_name"},
+        )
+        errors_before = REGISTRY.get_sample_value(
+            "api_gql_counts_errors_total",
+            labels={"operation_type": "unknown_type", "operation_name": "unknown_name"},
+        )
+        timer_before = REGISTRY.get_sample_value(
+            "api_gql_timers_full_runtime_seconds_count",
+            labels={"operation_type": "unknown_type", "operation_name": "unknown_name"},
+        )
         schema = generate_schema_that_raise_with(Exception("hello"))
         data = await self.do_query(schema)
         assert data["errors"] is not None
         assert data["errors"][0]["message"] == "hello"
         assert data["errors"][0]["extensions"] is not None
+        after = REGISTRY.get_sample_value(
+            "api_gql_counts_hits_total",
+            labels={"operation_type": "unknown_type", "operation_name": "unknown_name"},
+        )
+        errors_after = REGISTRY.get_sample_value(
+            "api_gql_counts_errors_total",
+            labels={"operation_type": "unknown_type", "operation_name": "unknown_name"},
+        )
+        timer_after = REGISTRY.get_sample_value(
+            "api_gql_timers_full_runtime_seconds_count",
+            labels={"operation_type": "unknown_type", "operation_name": "unknown_name"},
+        )
+        assert after - before == 1
+        assert errors_after - errors_before == 1
+        assert timer_after - timer_before == 1
+        patched_log.assert_called_with(
+            "Could not match gql query format for logging",
+            extra=dict(
+                query_slice="{ failing }",
+            ),
+        )
 
     @override_settings(DEBUG=False)
     async def test_when_debug_is_false_and_random_exception(self):
@@ -105,3 +140,100 @@ class ArianeViewTestCase(GraphQLTestHelper, TestCase):
                 request_body=dict(query="{ stuff }"),
             ),
         )
+
+    @patch("logging.Logger.info")
+    async def test_query_metrics_extension_set_type_and_name(self, patched_log):
+        extension = QueryMetricsExtension()
+        sample_named_query = "query MySession { operation body }"
+        sample_named_mutation = "mutation($input: CancelTrialInput!) { operation body }"
+        sample_unnamed_query = "{ owner(username: me) { continued operation body } }"
+        sample_wildcard = "{ failing }"
+
+        assert extension.operation_type is None
+        assert extension.operation_name is None
+
+        extension.set_type_and_name(query=sample_named_query)
+        assert extension.operation_type == "query"
+        assert extension.operation_name == "MySession"
+
+        extension.set_type_and_name(query=sample_named_mutation)
+        assert extension.operation_type == "mutation"
+        assert extension.operation_name == "CancelTrialInput"
+
+        extension.set_type_and_name(query=sample_unnamed_query)
+        assert extension.operation_type == "unknown_type"
+        assert extension.operation_name == "owner"
+
+        extension.set_type_and_name(query=sample_wildcard)
+        assert extension.operation_type == "unknown_type"
+        assert extension.operation_name == "unknown_name"
+        patched_log.assert_called_with(
+            "Could not match gql query format for logging",
+            extra=dict(
+                query_slice="{ failing }",
+            ),
+        )
+
+    @patch("regex.match")
+    @patch("logging.Logger.error")
+    @patch("logging.Logger.info")
+    async def test_query_metrics_extension_set_type_and_name_timeout(
+        self, patched_info_log, patched_error_log, patched_regex
+    ):
+        patched_regex.side_effect = TimeoutError
+        extension = QueryMetricsExtension()
+        sample_named_query = "query MySession { operation body }"
+
+        extension.set_type_and_name(query=sample_named_query)
+
+        patched_info_log.assert_called_with(
+            "Could not match gql query format for logging",
+            extra=dict(
+                query_slice=sample_named_query[:30],
+            ),
+        )
+        patched_error_log.assert_called_with(
+            "Regex Timeout Error",
+            extra=dict(
+                query_slice=sample_named_query[:30],
+            ),
+        )
+        assert extension.operation_type == "unknown_type"
+        assert extension.operation_name == "unknown_name"
+
+    @patch("sentry_sdk.metrics.incr")
+    @patch("graphql_api.views.AsyncGraphqlView._check_ratelimit")
+    async def test_when_rate_limit_reached(
+        self, mocked_check_ratelimit, mocked_sentry_incr
+    ):
+        schema = generate_cost_test_schema()
+        mocked_check_ratelimit.return_value = True
+        response = await self.do_query(schema, " { stuff }")
+
+        assert response["status"] == 429
+        assert (
+            response["detail"]
+            == "It looks like you've hit the rate limit of 300 req/min. Try again later."
+        )
+
+        expected_calls = [
+            call("graphql.info.request_made", tags={"path": "/graphql/gh"}),
+            call("graphql.error.rate_limit", tags={"path": "/graphql/gh"}),
+        ]
+        mocked_sentry_incr.assert_has_calls(expected_calls)
+
+    def test_client_ip_from_x_forwarded_for(self):
+        view = AsyncGraphqlView()
+        request = Mock()
+        request.META = {"HTTP_X_FORWARDED_FOR": "127.0.0.1,blah", "REMOTE_ADDR": "lol"}
+
+        result = view.get_client_ip(request)
+        assert result == "127.0.0.1"
+
+    def test_client_ip_from_remote_addr(self):
+        view = AsyncGraphqlView()
+        request = Mock()
+        request.META = {"HTTP_X_FORWARDED_FOR": None, "REMOTE_ADDR": "lol"}
+
+        result = view.get_client_ip(request)
+        assert result == "lol"

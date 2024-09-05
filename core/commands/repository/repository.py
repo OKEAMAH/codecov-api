@@ -1,3 +1,6 @@
+import uuid
+from typing import Optional
+
 from codecov.commands.base import BaseCommand
 from codecov_auth.models import Owner
 from core.models import Repository
@@ -5,15 +8,51 @@ from timeseries.models import MeasurementName
 
 from .interactors.activate_measurements import ActivateMeasurementsInteractor
 from .interactors.encode_secret_string import EncodeSecretStringInteractor
+from .interactors.erase_repository import EraseRepositoryInteractor
 from .interactors.fetch_repository import FetchRepositoryInteractor
 from .interactors.get_repository_token import GetRepositoryTokenInteractor
 from .interactors.get_upload_token import GetUploadTokenInteractor
 from .interactors.regenerate_repository_token import RegenerateRepositoryTokenInteractor
+from .interactors.regenerate_repository_upload_token import (
+    RegenerateRepositoryUploadTokenInteractor,
+)
+from .interactors.update_repository import UpdateRepositoryInteractor
 
 
 class RepositoryCommands(BaseCommand):
-    def fetch_repository(self, owner, name):
-        return self.get_interactor(FetchRepositoryInteractor).execute(owner, name)
+    def fetch_repository(
+        self,
+        owner,
+        name,
+        okta_authenticated_accounts: list[int],
+        exclude_okta_enforced_repos: bool = True,
+    ) -> Repository:
+        return self.get_interactor(FetchRepositoryInteractor).execute(
+            owner,
+            name,
+            okta_authenticated_accounts,
+            exclude_okta_enforced_repos=exclude_okta_enforced_repos,
+        )
+
+    def regenerate_repository_upload_token(
+        self,
+        repo_name: str,
+        owner_username: str,
+    ) -> uuid.UUID:
+        return self.get_interactor(RegenerateRepositoryUploadTokenInteractor).execute(
+            repo_name, owner_username
+        )
+
+    def update_repository(
+        self,
+        repo_name: str,
+        owner: Owner,
+        default_branch: Optional[str],
+        activated: Optional[bool],
+    ):
+        return self.get_interactor(UpdateRepositoryInteractor).execute(
+            repo_name, owner, default_branch, activated
+        )
 
     def get_upload_token(self, repository):
         return self.get_interactor(GetUploadTokenInteractor).execute(repository)
@@ -37,7 +76,10 @@ class RepositoryCommands(BaseCommand):
             repo_name, owner_name, measurement_type
         )
 
-    def encode_secret_string(self, owner: Owner, repo: Repository, value: str):
+    def erase_repository(self, repo_name: str, owner: Owner):
+        return self.get_interactor(EraseRepositoryInteractor).execute(repo_name, owner)
+
+    def encode_secret_string(self, owner: Owner, repo_name: str, value: str):
         return self.get_interactor(EncodeSecretStringInteractor).execute(
-            owner, repo, value
+            owner, repo_name, value
         )

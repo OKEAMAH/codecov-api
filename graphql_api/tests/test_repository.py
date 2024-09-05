@@ -5,13 +5,13 @@ from django.test import TransactionTestCase, override_settings
 from freezegun import freeze_time
 
 from codecov_auth.tests.factories import OwnerFactory
-from core import models
 from core.tests.factories import (
     CommitFactory,
     PullFactory,
     RepositoryFactory,
     RepositoryTokenFactory,
 )
+from reports.tests.factories import TestFactory, TestInstanceFactory
 from services.profiling import CriticalFile
 
 from .helper import GraphQLTestHelper
@@ -75,6 +75,7 @@ default_fields = """
     bundleAnalysisEnabled
     coverageEnabled
     bot { username }
+    testAnalyticsEnabled
 """
 
 
@@ -109,6 +110,7 @@ class TestFetchRepository(GraphQLTestHelper, TransactionTestCase):
             yaml=self.yaml,
             language="rust",
             languages=["python", "rust"],
+            test_analytics_enabled=True,
         )
         profiling_token = RepositoryTokenFactory(
             repository_id=repo.repoid, token_type="profiling"
@@ -140,6 +142,7 @@ class TestFetchRepository(GraphQLTestHelper, TransactionTestCase):
             "bundleAnalysisEnabled": False,
             "coverageEnabled": False,
             "bot": None,
+            "testAnalyticsEnabled": True,
         }
 
     @freeze_time("2021-01-01")
@@ -197,6 +200,7 @@ class TestFetchRepository(GraphQLTestHelper, TransactionTestCase):
             "bundleAnalysisEnabled": False,
             "coverageEnabled": False,
             "bot": None,
+            "testAnalyticsEnabled": False,
         }
 
     @freeze_time("2021-01-01")
@@ -298,7 +302,7 @@ class TestFetchRepository(GraphQLTestHelper, TransactionTestCase):
             owner=user,
             variables={"name": repo.name},
         )
-        assert data["me"]["owner"]["repository"]["yaml"] == None
+        assert data["me"]["owner"]["repository"]["yaml"] is None
 
     def test_repository_resolve_bot(self):
         user = OwnerFactory()
@@ -535,12 +539,26 @@ class TestFetchRepository(GraphQLTestHelper, TransactionTestCase):
         res = self.fetch_repository(repo.name)
         assert res["coverageEnabled"] == True
 
+    def test_repository_get_test_analytics_enabled(self) -> None:
+        repo = RepositoryFactory(
+            author=self.owner, active=True, private=True, test_analytics_enabled=True
+        )
+        res = self.fetch_repository(repo.name)
+        assert res["testAnalyticsEnabled"] == True
+
+    def test_repository_get_test_analytics_disabled(self) -> None:
+        repo = RepositoryFactory(
+            author=self.owner, active=True, private=True, test_analytics_enabled=False
+        )
+        res = self.fetch_repository(repo.name)
+        assert res["testAnalyticsEnabled"] == False
+
     def test_repository_get_languages_null(self):
         repo = RepositoryFactory(
             author=self.owner, active=True, private=True, languages=None
         )
         res = self.fetch_repository(repo.name)
-        assert res["languages"] == None
+        assert res["languages"] is None
 
     def test_repository_get_languages_empty(self):
         repo = RepositoryFactory(author=self.owner, active=True, private=True)
@@ -736,3 +754,341 @@ class TestFetchRepository(GraphQLTestHelper, TransactionTestCase):
         )
 
         assert data["me"]["owner"]["repository"]["isFirstPullRequest"] == False
+
+    @patch("shared.rate_limits.determine_entity_redis_key")
+    @patch("shared.rate_limits.determine_if_entity_is_rate_limited")
+    @override_settings(IS_ENTERPRISE=True, GUEST_ACCESS=False)
+    def test_fetch_is_github_rate_limited(
+        self, mock_determine_rate_limit, mock_determine_redis_key
+    ):
+        repo = RepositoryFactory(
+            author=self.owner,
+            active=True,
+            private=True,
+            yaml={"component_management": {}},
+        )
+
+        mock_determine_redis_key.return_value = "test"
+        mock_determine_rate_limit.return_value = True
+
+        data = self.gql_request(
+            query_repository
+            % """
+                isGithubRateLimited
+            """,
+            owner=self.owner,
+            variables={"name": repo.name},
+        )
+
+        assert data["me"]["owner"]["repository"]["isGithubRateLimited"] == True
+
+    def test_fetch_is_github_rate_limited_not_on_gh_service(self):
+        owner = OwnerFactory(service="gitlab")
+        repo = RepositoryFactory(
+            author=owner,
+            author__service="gitlab",
+            service_id=12345,
+            active=True,
+        )
+
+        data = self.gql_request(
+            query_repository
+            % """
+                isGithubRateLimited
+            """,
+            owner=owner,
+            variables={"name": repo.name},
+            provider="gitlab",
+        )
+
+        assert data["me"]["owner"]["repository"]["isGithubRateLimited"] == False
+
+    @patch("shared.rate_limits.determine_entity_redis_key")
+    @patch("shared.rate_limits.determine_if_entity_is_rate_limited")
+    @patch("logging.Logger.warning")
+    @override_settings(IS_ENTERPRISE=True, GUEST_ACCESS=False)
+    def test_fetch_is_github_rate_limited_but_errors(
+        self,
+        mock_log_warning,
+        mock_determine_rate_limit,
+        mock_determine_redis_key,
+    ):
+        repo = RepositoryFactory(
+            author=self.owner,
+            active=True,
+            private=True,
+            yaml={"component_management": {}},
+        )
+
+        mock_determine_redis_key.side_effect = Exception("some random error lol")
+        mock_determine_rate_limit.return_value = True
+
+        data = self.gql_request(
+            query_repository
+            % """
+                isGithubRateLimited
+            """,
+            owner=self.owner,
+            variables={"name": repo.name},
+        )
+
+        assert data["me"]["owner"]["repository"]["isGithubRateLimited"] is None
+
+        mock_log_warning.assert_called_once_with(
+            "Error when checking rate limit",
+            extra={
+                "repo_id": repo.repoid,
+                "has_owner": True,
+            },
+        )
+
+    def test_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test, created_at=datetime.datetime.now(), repoid=repo.repoid
+        )
+        res = self.fetch_repository(
+            repo.name, """testResults { edges { node { name } } }"""
+        )
+        assert res["testResults"] == {"edges": [{"node": {"name": test.name}}]}
+
+    def test_test_results_no_tests(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        res = self.fetch_repository(
+            repo.name, """testResults { edges { node { name } } }"""
+        )
+        assert res["testResults"] == {"edges": []}
+
+    def test_branch_filter_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            branch="main",
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            branch="feature",
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(filters: { branch: "main"}) { edges { node { name } } }""",
+        )
+        assert res["testResults"] == {"edges": [{"node": {"name": test.name}}]}
+
+    def test_commits_failed_ordering_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            commitid="1",
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            commitid="2",
+        )
+        test_2 = TestFactory(repository=repo)
+        _test_instance_3 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            commitid="3",
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(ordering: { parameter: COMMITS_WHERE_FAIL, direction: ASC }) { edges { node { name commitsFailed } } }""",
+        )
+        assert res["testResults"] == {
+            "edges": [
+                {"node": {"name": test_2.name, "commitsFailed": 1}},
+                {"node": {"name": test.name, "commitsFailed": 2}},
+            ]
+        }
+
+    def test_desc_commits_failed_ordering_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            commitid="1",
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            commitid="2",
+        )
+        test_2 = TestFactory(repository=repo)
+        _test_instance_3 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            commitid="3",
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(ordering: { parameter: COMMITS_WHERE_FAIL, direction: DESC }) { edges { node { name commitsFailed } } }""",
+        )
+        assert res["testResults"] == {
+            "edges": [
+                {"node": {"name": test.name, "commitsFailed": 2}},
+                {"node": {"name": test_2.name, "commitsFailed": 1}},
+            ]
+        }
+
+    def test_avg_duration_ordering_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            duration_seconds=1,
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            duration_seconds=2,
+        )
+        test_2 = TestFactory(repository=repo)
+        _test_instance_3 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            duration_seconds=3,
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(ordering: { parameter: AVG_DURATION, direction: ASC }) { edges { node { name avgDuration } } }""",
+        )
+        assert res["testResults"] == {
+            "edges": [
+                {"node": {"name": test.name, "avgDuration": 1.5}},
+                {"node": {"name": test_2.name, "avgDuration": 3}},
+            ]
+        }
+
+    def test_desc_avg_duration_ordering_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            duration_seconds=1,
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            duration_seconds=2,
+        )
+        test_2 = TestFactory(repository=repo)
+        _test_instance_3 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            duration_seconds=3,
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(ordering: { parameter: AVG_DURATION, direction: DESC }) { edges { node { name avgDuration } } }""",
+        )
+        assert res["testResults"] == {
+            "edges": [
+                {"node": {"name": test_2.name, "avgDuration": 3}},
+                {"node": {"name": test.name, "avgDuration": 1.5}},
+            ]
+        }
+
+    def test_failure_rate_ordering_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="pass",
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="failure",
+        )
+        test_2 = TestFactory(repository=repo)
+        _test_instance_3 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="failure",
+        )
+        _test_instance_4 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="failure",
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(ordering: { parameter: FAILURE_RATE, direction: ASC }) { edges { node { name failureRate } } }""",
+        )
+
+        assert res["testResults"] == {
+            "edges": [
+                {"node": {"name": test.name, "failureRate": 0.5}},
+                {"node": {"name": test_2.name, "failureRate": 1.0}},
+            ]
+        }
+
+    def test_desc_failure_rate_ordering_on_test_results(self) -> None:
+        repo = RepositoryFactory(author=self.owner, active=True, private=True)
+        test = TestFactory(repository=repo)
+        _test_instance_1 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="pass",
+        )
+        _test_instance_2 = TestInstanceFactory(
+            test=test,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="failure",
+        )
+        test_2 = TestFactory(repository=repo)
+        _test_instance_3 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="failure",
+        )
+        _test_instance_4 = TestInstanceFactory(
+            test=test_2,
+            created_at=datetime.datetime.now(),
+            repoid=repo.repoid,
+            outcome="failure",
+        )
+        res = self.fetch_repository(
+            repo.name,
+            """testResults(ordering: { parameter: FAILURE_RATE, direction: DESC }) { edges { node { name failureRate } } }""",
+        )
+
+        assert res["testResults"] == {
+            "edges": [
+                {"node": {"name": test_2.name, "failureRate": 1.0}},
+                {"node": {"name": test.name, "failureRate": 0.5}},
+            ]
+        }

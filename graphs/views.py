@@ -1,14 +1,12 @@
 import logging
 
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import connection
 from django.http import Http404
 from rest_framework import exceptions
 from rest_framework.exceptions import NotFound
 from rest_framework.negotiation import DefaultContentNegotiation
 from rest_framework.permissions import AllowAny
 from rest_framework.views import APIView
-from shared.reports.resources import Report
 
 import services.report as report_service
 from api.shared.mixins import RepoPropertyMixin
@@ -54,7 +52,7 @@ class BadgeHandler(APIView, RepoPropertyMixin, GraphBadgeAPIMixin):
     def get_object(self, request, *args, **kwargs):
         # Validate coverage precision
         precision = self.request.query_params.get("precision", "0")
-        if not precision in self.precisions:
+        if precision not in self.precisions:
             raise NotFound("Coverage precision should be one of [ 0 || 1 || 2 ]")
 
         coverage, coverage_range = self.get_coverage()
@@ -158,36 +156,36 @@ class GraphHandler(APIView, RepoPropertyMixin, GraphBadgeAPIMixin):
         if graph == "tree":
             options["width"] = int(
                 self.request.query_params.get(
-                    "width", settings["sunburst"]["options"]["width"]
+                    "width", settings["sunburst"]["options"]["width"] or 100
                 )
             )
             options["height"] = int(
                 self.request.query_params.get(
-                    "height", settings["sunburst"]["options"]["height"]
+                    "height", settings["sunburst"]["options"]["height"] or 100
                 )
             )
             return tree(flare, None, None, **options)
         elif graph == "icicle":
             options["width"] = int(
                 self.request.query_params.get(
-                    "width", settings["icicle"]["options"]["width"]
+                    "width", settings["icicle"]["options"]["width"] or 100
                 )
             )
             options["height"] = int(
                 self.request.query_params.get(
-                    "height", settings["icicle"]["options"]["height"]
+                    "height", settings["icicle"]["options"]["height"] or 100
                 )
             )
             return icicle(flare, **options)
         elif graph == "sunburst":
             options["width"] = int(
                 self.request.query_params.get(
-                    "width", settings["sunburst"]["options"]["width"]
+                    "width", settings["sunburst"]["options"]["width"] or 100
                 )
             )
             options["height"] = int(
                 self.request.query_params.get(
-                    "height", settings["sunburst"]["options"]["height"]
+                    "height", settings["sunburst"]["options"]["height"] or 100
                 )
             )
             return sunburst(flare, **options)

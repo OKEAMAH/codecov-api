@@ -2,7 +2,6 @@ from traceback import format_stack
 
 import requests
 from django.contrib.admin.models import CHANGE, LogEntry
-from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 
 from codecov_auth.constants import GITLAB_BASE_URL
@@ -52,7 +51,7 @@ class History:
         if action_flag is None:
             action_flag = CHANGE
 
-        if type(objects) is not list:
+        if not isinstance(objects, list):
             objects = [objects]
 
         if add_traceback:

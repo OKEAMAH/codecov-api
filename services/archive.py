@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from django.conf import settings
 from django.utils import timezone
-from minio import Minio
 from shared.utils.ReportEncoder import ReportEncoder
 
 from services.storage import StorageService
@@ -142,14 +141,6 @@ class ArchiveService(object):
         stringified_data = json.dumps(data, cls=encoder)
         self.write_file(path, stringified_data)
         return path
-
-    """
-    Grabs path from storage, adds data to path object
-    writes back to path, overwriting the original contents
-    """
-
-    def update_archive(self, path, data):
-        self.storage.append_to_file(self.root, path, data)
 
     """
     Writes a generic file to the archive -- it's typically recommended to

@@ -6,12 +6,15 @@ from django.test import TransactionTestCase, override_settings
 from django.utils import timezone
 from freezegun import freeze_time
 from graphql import GraphQLError
+from prometheus_client import REGISTRY
+from shared.django_apps.codecov_auth.tests.factories import OktaSettingsFactory
 from shared.django_apps.reports.models import ReportType
 from shared.upload.utils import UploaderType, insert_coverage_measurement
 
 from codecov.commands.exceptions import MissingService, UnauthorizedGuestAccess
 from codecov_auth.models import OwnerProfile
 from codecov_auth.tests.factories import (
+    AccountFactory,
     GetAdminProviderAdapter,
     OwnerFactory,
     UserFactory,
@@ -24,6 +27,7 @@ from .helper import GraphQLTestHelper, paginate_connection
 
 query_repositories = """{
     owner(username: "%s") {
+        delinquent
         orgUploadToken
         ownerid
         isCurrentUserPartOfOrg
@@ -47,7 +51,11 @@ query_repositories = """{
 
 class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
     def setUp(self):
-        self.owner = OwnerFactory(username="codecov-user", service="github")
+        self.account = AccountFactory()
+        self.owner = OwnerFactory(
+            username="codecov-user", service="github", account=self.account
+        )
+        self.okta_settings = OktaSettingsFactory(account=self.account, enforced=True)
         random_user = OwnerFactory(username="random-user", service="github")
         RepositoryFactory(
             author=self.owner, active=True, activated=True, private=True, name="a"
@@ -58,19 +66,27 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         RepositoryFactory(
             author=random_user, active=True, activated=False, private=True, name="not"
         )
-        RepositoryFactory(
-            author=random_user,
-            active=True,
-            private=False,
-            activated=True,
-            name="still-not",
-        )
 
     def test_fetching_repositories(self):
+        before = REGISTRY.get_sample_value(
+            "api_gql_counts_hits_total",
+            labels={"operation_type": "unknown_type", "operation_name": "owner"},
+        )
+        errors_before = REGISTRY.get_sample_value(
+            "api_gql_counts_errors_total",
+            labels={"operation_type": "unknown_type", "operation_name": "owner"},
+        )
+        timer_before = REGISTRY.get_sample_value(
+            "api_gql_timers_full_runtime_seconds_count",
+            labels={"operation_type": "unknown_type", "operation_name": "owner"},
+        )
         query = query_repositories % (self.owner.username, "", "")
-        data = self.gql_request(query, owner=self.owner)
+        data = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         assert data == {
             "owner": {
+                "delinquent": None,
                 "orgUploadToken": None,
                 "ownerid": self.owner.ownerid,
                 "isCurrentUserPartOfOrg": True,
@@ -82,11 +98,28 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
                 },
             }
         }
+        after = REGISTRY.get_sample_value(
+            "api_gql_counts_hits_total",
+            labels={"operation_type": "unknown_type", "operation_name": "owner"},
+        )
+        errors_after = REGISTRY.get_sample_value(
+            "api_gql_counts_errors_total",
+            labels={"operation_type": "unknown_type", "operation_name": "owner"},
+        )
+        timer_after = REGISTRY.get_sample_value(
+            "api_gql_timers_full_runtime_seconds_count",
+            labels={"operation_type": "unknown_type", "operation_name": "owner"},
+        )
+        assert after - before == 1
+        assert errors_after - errors_before == 0
+        assert timer_after - timer_before == 1
 
     def test_fetching_repositories_with_pagination(self):
         query = query_repositories % (self.owner.username, "(first: 1)", "endCursor")
         # Check on the first page if we have the repository b
-        data_page_one = self.gql_request(query, owner=self.owner)
+        data_page_one = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         connection = data_page_one["owner"]["repositories"]
         assert connection["edges"][0]["node"] == {"name": "a"}
         pageInfo = connection["pageInfo"]
@@ -98,7 +131,9 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
             f'(first: 1, after: "{next_cursor}")',
             "endCursor",
         )
-        data_page_two = self.gql_request(query, owner=self.owner)
+        data_page_two = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         connection = data_page_two["owner"]["repositories"]
         assert connection["edges"][0]["node"] == {"name": "b"}
         pageInfo = connection["pageInfo"]
@@ -110,7 +145,9 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
             "(filters: { active: true })",
             "",
         )
-        data = self.gql_request(query, owner=self.owner)
+        data = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "a"}]
 
@@ -120,7 +157,9 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
             '(filters: { term: "a" })',
             "",
         )
-        data = self.gql_request(query, owner=self.owner)
+        data = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "a"}]
 
@@ -136,7 +175,9 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
             "(ordering: NAME, orderingDirection: DESC)",
             "",
         )
-        data = self.gql_request(query, owner=self.owner)
+        data = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "b"}, {"name": "a"}]
 
@@ -150,13 +191,27 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "b"}]
 
+    def test_fetch_account(self) -> None:
+        query = """{
+            owner(username: "%s") {
+                account {
+                    name
+                }
+            }
+        }
+        """ % (self.owner.username)
+        data = self.gql_request(query, owner=self.owner)
+        assert data["owner"]["account"]["name"] == self.account.name
+
     def test_fetching_repositories_active_repositories(self):
         query = query_repositories % (
             self.owner.username,
             "(filters: { active: true })",
             "",
         )
-        data = self.gql_request(query, owner=self.owner)
+        data = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "a"}]
 
@@ -166,7 +221,9 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
             "(filters: { activated: true })",
             "",
         )
-        data = self.gql_request(query, owner=self.owner)
+        data = self.gql_request(
+            query, owner=self.owner, okta_signed_in_accounts=[self.account.id]
+        )
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "a"}]
 
@@ -179,6 +236,16 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         data = self.gql_request(query, owner=self.owner)
         repos = paginate_connection(data["owner"]["repositories"])
         assert repos == [{"name": "b"}]
+
+    def test_fetching_repositories_filter_out_okta_enforced(self):
+        query = query_repositories % (
+            self.owner.username,
+            '(filters: {  term: "a" })',
+            "",
+        )
+        data = self.gql_request(query, owner=self.owner)
+        repos = paginate_connection(data["owner"]["repositories"])
+        assert repos == []
 
     def test_is_part_of_org_when_unauthenticated(self):
         query = query_repositories % (self.owner.username, "", "")
@@ -319,6 +386,11 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         data = self.gql_request(query, owner=self.owner)
         assert data["owner"]["ownerid"] == self.owner.ownerid
 
+    def test_delinquent(self):
+        query = query_repositories % (self.owner.username, "", "")
+        data = self.gql_request(query, owner=self.owner)
+        assert data["owner"]["delinquent"] == self.owner.delinquent
+
     @patch("codecov_auth.commands.owner.owner.OwnerCommands.get_org_upload_token")
     def test_get_org_upload_token(self, mocker):
         mocker.return_value = "upload_token"
@@ -338,7 +410,7 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         }
         """ % (owner.username)
         data = self.gql_request(query, owner=owner)
-        assert data["owner"]["defaultOrgUsername"] == None
+        assert data["owner"]["defaultOrgUsername"] is None
 
     def test_get_default_org_username_for_owner(self):
         organization = OwnerFactory(username="sample-org", service="github")
@@ -370,7 +442,7 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         }
         """ % (owner.username)
         data = self.gql_request(query, owner=owner)
-        assert data["owner"]["defaultOrgUsername"] == None
+        assert data["owner"]["defaultOrgUsername"] is None
 
     def test_owner_without_owner_profile_returns_no_default_org(self):
         owner = OwnerFactory(username="sample-owner", service="github")
@@ -382,7 +454,7 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         }
         """ % (owner.username)
         data = self.gql_request(query, owner=owner)
-        assert data["owner"]["defaultOrgUsername"] == None
+        assert data["owner"]["defaultOrgUsername"] is None
 
     def test_is_current_user_not_activated(self):
         owner = OwnerFactory(username="sample-owner", service="github")
@@ -450,9 +522,11 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         data = self.gql_request(query)
         assert data["owner"]["isCurrentUserActivated"] == False
 
-    def test_admin_is_current_user_activated_authorized(self):
+    def test_is_current_user_activated_admin_activated(self):
         owner = OwnerFactory(
-            username="sample-owner-authorized", admins=[self.owner.ownerid]
+            username="sample-owner-authorized",
+            admins=[self.owner.ownerid],
+            plan_activated_users=[self.owner.ownerid],
         )
         self.owner.organizations = [owner.ownerid]
         self.owner.save()
@@ -464,6 +538,23 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         """ % (owner.username)
         data = self.gql_request(query, owner=self.owner)
         assert data["owner"]["isCurrentUserActivated"] == True
+
+    def test_is_current_user_activated_admin_not_activated(self):
+        owner = OwnerFactory(
+            username="sample-owner-authorized",
+            admins=[self.owner.ownerid],
+            plan_activated_users=None,
+        )
+        self.owner.organizations = [owner.ownerid]
+        self.owner.save()
+        query = """{
+            owner(username: "%s") {
+                isCurrentUserActivated
+            }
+        }
+        """ % (owner.username)
+        data = self.gql_request(query, owner=self.owner)
+        assert data["owner"]["isCurrentUserActivated"] == False
 
     def test_owner_is_current_user_activated(self):
         query = """{
@@ -642,3 +733,97 @@ class TestOwnerType(GraphQLTestHelper, TransactionTestCase):
         except GraphQLError as e:
             assert e.message == UnauthorizedGuestAccess.message
             assert e.extensions["code"] == UnauthorizedGuestAccess.code
+
+    def test_fetch_current_user_is_okta_authenticated(self):
+        account = AccountFactory()
+        owner = OwnerFactory(username="sample-owner", service="github", account=account)
+        owner.save()
+
+        user = OwnerFactory(username="sample-user")
+        user.organizations = [owner.ownerid]
+        user.save()
+
+        query = """{
+            owner(username: "%s") {
+                isUserOktaAuthenticated
+            }
+        }
+        """ % (owner.username)
+
+        data = self.gql_request(query, owner=user, okta_signed_in_accounts=[account.pk])
+        assert data["owner"]["isUserOktaAuthenticated"] == True
+
+    def test_fetch_current_user_is_not_okta_authenticated(self):
+        account = AccountFactory()
+        owner = OwnerFactory(username="sample-owner", service="github", account=account)
+        owner.save()
+
+        user = OwnerFactory(username="sample-user")
+        user.organizations = [owner.ownerid]
+        user.save()
+
+        query = """{
+            owner(username: "%s") {
+                isUserOktaAuthenticated
+            }
+        }
+        """ % (owner.username)
+
+        data = self.gql_request(query, owner=user, okta_signed_in_accounts=[])
+        assert data["owner"]["isUserOktaAuthenticated"] == False
+
+    def test_fetch_current_user_is_not_okta_authenticated_no_account(self):
+        owner = OwnerFactory(username="sample-owner", service="github")
+        owner.save()
+
+        user = OwnerFactory(username="sample-user")
+        user.organizations = [owner.ownerid]
+        user.save()
+
+        query = """{
+            owner(username: "%s") {
+                isUserOktaAuthenticated
+            }
+        }
+        """ % (owner.username)
+
+        data = self.gql_request(query, owner=user, okta_signed_in_accounts=[])
+        assert data["owner"]["isUserOktaAuthenticated"] == False
+
+    @patch("shared.rate_limits.determine_entity_redis_key")
+    @patch("shared.rate_limits.determine_if_entity_is_rate_limited")
+    @override_settings(IS_ENTERPRISE=True, GUEST_ACCESS=False)
+    def test_fetch_is_github_rate_limited(
+        self, mock_determine_rate_limit, mock_determine_redis_key
+    ):
+        current_org = OwnerFactory(
+            username="random-plan-user",
+            service="github",
+        )
+        query = """{
+            owner(username: "%s") {
+                isGithubRateLimited
+            }
+        }
+
+        """ % (current_org.username)
+        mock_determine_redis_key.return_value = "test"
+        mock_determine_rate_limit.return_value = True
+
+        data = self.gql_request(query, owner=current_org)
+        assert data["owner"]["isGithubRateLimited"] == True
+
+    def test_fetch_is_github_rate_limited_not_on_gh_service(self):
+        current_org = OwnerFactory(
+            username="random-plan-user",
+            service="bitbucket",
+        )
+        query = """{
+            owner(username: "%s") {
+                isGithubRateLimited
+            }
+        }
+
+        """ % (current_org.username)
+        data = self.gql_request(query, owner=current_org, provider="bb")
+        assert data["owner"]["isGithubRateLimited"] == False

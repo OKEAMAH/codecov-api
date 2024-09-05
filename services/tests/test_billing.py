@@ -56,14 +56,14 @@ expected_invoices = [
                     "object": "line_item",
                     "amount": 120,
                     "currency": "usd",
-                    "description": "(10) users-inappm",
+                    "description": "(10) users-pr-inappm",
                     "discountable": True,
                     "livemode": False,
                     "metadata": {},
                     "period": {"end": 1521326190, "start": 1518906990},
                     "plan": {
                         "id": "ivory-freelance-040",
-                        "name": "users-inappm",
+                        "name": "users-pr-inappm",
                         "object": "plan",
                         "active": True,
                         "aggregate_usage": None,
@@ -893,9 +893,11 @@ class StripeServiceTests(TestCase):
             plan=PlanName.CODECOV_PRO_MONTHLY.value, plan_user_count=20
         )
         desired_plan = {"value": PlanName.SENTRY_MONTHLY.value, "quantity": 19}
-        self.stripe._get_proration_params(owner, desired_plan) == "none"
+        assert self.stripe._get_proration_params(owner, desired_plan) == "none"
         desired_plan = {"value": PlanName.SENTRY_MONTHLY.value, "quantity": 20}
-        self.stripe._get_proration_params(owner, desired_plan) == "always_invoice"
+        assert (
+            self.stripe._get_proration_params(owner, desired_plan) == "always_invoice"
+        )
         desired_plan = {"value": PlanName.SENTRY_MONTHLY.value, "quantity": 21}
         assert (
             self.stripe._get_proration_params(owner, desired_plan) == "always_invoice"
@@ -984,14 +986,12 @@ class StripeServiceTests(TestCase):
         assert self.stripe._get_proration_params(owner, desired_plan) == "none"
 
     @patch("services.billing.stripe.checkout.Session.create")
-    def test_create_checkout_session_with_email_and_no_stripe_customer_id(
+    def test_create_checkout_session_with_no_stripe_customer_id(
         self, create_checkout_session_mock
     ):
-        email = "test-email@gmail.com"
         stripe_customer_id = None
         owner = OwnerFactory(
             service=Service.GITHUB.value,
-            email=email,
             stripe_customer_id=stripe_customer_id,
         )
         expected_id = "fkkgosd"
@@ -1009,7 +1009,6 @@ class StripeServiceTests(TestCase):
             payment_method_types=["card"],
             payment_method_collection="if_required",
             client_reference_id=str(owner.ownerid),
-            customer_email=owner.email,
             customer=None,
             success_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?success",
             cancel_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?cancel",
@@ -1030,66 +1029,17 @@ class StripeServiceTests(TestCase):
                     "obo": self.user.ownerid,
                 },
             },
+            tax_id_collection={"enabled": True},
+            customer_update=None,
         )
 
     @patch("services.billing.stripe.checkout.Session.create")
-    def test_create_checkout_session_with_no_email_and_no_stripe_customer_id(
+    def test_create_checkout_session_with_stripe_customer_id(
         self, create_checkout_session_mock
     ):
-        email = None
-        stripe_customer_id = None
-        owner = OwnerFactory(
-            service=Service.GITHUB.value,
-            email=email,
-            stripe_customer_id=stripe_customer_id,
-        )
-        expected_id = "fkkgosd"
-        create_checkout_session_mock.return_value = {"id": expected_id}
-        desired_quantity = 25
-        desired_plan = {
-            "value": PlanName.CODECOV_PRO_MONTHLY.value,
-            "quantity": desired_quantity,
-        }
-
-        assert self.stripe.create_checkout_session(owner, desired_plan) == expected_id
-
-        create_checkout_session_mock.assert_called_once_with(
-            billing_address_collection="required",
-            payment_method_types=["card"],
-            payment_method_collection="if_required",
-            client_reference_id=str(owner.ownerid),
-            customer_email=owner.email,
-            customer=None,
-            success_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?success",
-            cancel_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?cancel",
-            mode="subscription",
-            line_items=[
-                {
-                    "price": settings.STRIPE_PLAN_IDS[desired_plan["value"]],
-                    "quantity": desired_quantity,
-                }
-            ],
-            subscription_data={
-                "metadata": {
-                    "service": owner.service,
-                    "obo_organization": owner.ownerid,
-                    "username": owner.username,
-                    "obo_name": self.user.name,
-                    "obo_email": self.user.email,
-                    "obo": self.user.ownerid,
-                },
-            },
-        )
-
-    @patch("services.billing.stripe.checkout.Session.create")
-    def test_create_checkout_session_with_stripe_customer_id_and_no_email(
-        self, create_checkout_session_mock
-    ):
-        email = None
         stripe_customer_id = "test-cusa78723hb4@"
         owner = OwnerFactory(
             service=Service.GITHUB.value,
-            email=email,
             stripe_customer_id=stripe_customer_id,
         )
         expected_id = "fkkgosd"
@@ -1108,7 +1058,6 @@ class StripeServiceTests(TestCase):
             payment_method_collection="if_required",
             client_reference_id=str(owner.ownerid),
             customer=owner.stripe_customer_id,
-            customer_email=None,
             success_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?success",
             cancel_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?cancel",
             mode="subscription",
@@ -1128,67 +1077,19 @@ class StripeServiceTests(TestCase):
                     "obo": self.user.ownerid,
                 },
             },
-        )
-
-    @patch("services.billing.stripe.checkout.Session.create")
-    def test_create_checkout_session_with_stripe_customer_id_and_email(
-        self, create_checkout_session_mock
-    ):
-        email = "test-email@gmail.com"
-        stripe_customer_id = "test-cusa78723hb4@"
-        owner = OwnerFactory(
-            service=Service.GITHUB.value,
-            email=email,
-            stripe_customer_id=stripe_customer_id,
-        )
-        expected_id = "fkkgosd"
-        create_checkout_session_mock.return_value = {"id": expected_id}
-        desired_quantity = 25
-        desired_plan = {
-            "value": PlanName.CODECOV_PRO_MONTHLY.value,
-            "quantity": desired_quantity,
-        }
-
-        assert self.stripe.create_checkout_session(owner, desired_plan) == expected_id
-
-        create_checkout_session_mock.assert_called_once_with(
-            billing_address_collection="required",
-            payment_method_types=["card"],
-            payment_method_collection="if_required",
-            client_reference_id=str(owner.ownerid),
-            customer=owner.stripe_customer_id,
-            customer_email=None,
-            success_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?success",
-            cancel_url=f"{settings.CODECOV_DASHBOARD_URL}/plan/gh/{owner.username}?cancel",
-            mode="subscription",
-            line_items=[
-                {
-                    "price": settings.STRIPE_PLAN_IDS[desired_plan["value"]],
-                    "quantity": desired_quantity,
-                }
-            ],
-            subscription_data={
-                "metadata": {
-                    "service": owner.service,
-                    "obo_organization": owner.ownerid,
-                    "username": owner.username,
-                    "obo_name": self.user.name,
-                    "obo_email": self.user.email,
-                    "obo": self.user.ownerid,
-                },
-            },
+            tax_id_collection={"enabled": True},
+            customer_update={"name": "auto", "address": "auto"},
         )
 
     def test_get_subscription_when_no_subscription(self):
         owner = OwnerFactory(stripe_subscription_id=None)
-        assert self.stripe.get_subscription(owner) == None
+        assert self.stripe.get_subscription(owner) is None
 
     @patch("services.billing.stripe.Subscription.retrieve")
     def test_get_subscription_returns_stripe_data(self, subscription_retrieve_mock):
         owner = OwnerFactory(stripe_subscription_id="abc")
         # only including fields relevant to implementation
         stripe_data_subscription = {"doesnt": "matter"}
-        payment_method_id = "pm_something_something"
         subscription_retrieve_mock.return_value = stripe_data_subscription
         assert self.stripe.get_subscription(owner) == stripe_data_subscription
         subscription_retrieve_mock.assert_called_once_with(
@@ -1197,16 +1098,20 @@ class StripeServiceTests(TestCase):
                 "latest_invoice",
                 "customer",
                 "customer.invoice_settings.default_payment_method",
+                "customer.tax_ids",
             ],
         )
 
     def test_update_payment_method_when_no_subscription(self):
         owner = OwnerFactory(stripe_subscription_id=None)
-        assert self.stripe.update_payment_method(owner, "abc") == None
+        assert self.stripe.update_payment_method(owner, "abc") is None
 
     @patch("services.billing.stripe.PaymentMethod.attach")
     @patch("services.billing.stripe.Customer.modify")
-    def test_update_payment_method(self, modify_customer_mock, attach_payment_mock):
+    @patch("services.billing.stripe.Subscription.modify")
+    def test_update_payment_method(
+        self, modify_sub_mock, modify_customer_mock, attach_payment_mock
+    ):
         payment_method_id = "pm_1234567"
         subscription_id = "sub_abc"
         customer_id = "cus_abc"
@@ -1221,13 +1126,17 @@ class StripeServiceTests(TestCase):
             customer_id, invoice_settings={"default_payment_method": payment_method_id}
         )
 
+        modify_sub_mock.assert_called_once_with(
+            subscription_id, default_payment_method=payment_method_id
+        )
+
     def test_update_email_address_with_invalid_email(self):
         owner = OwnerFactory(stripe_subscription_id=None)
-        assert self.stripe.update_email_address(owner, "not-an-email") == None
+        assert self.stripe.update_email_address(owner, "not-an-email") is None
 
     def test_update_email_address_when_no_subscription(self):
         owner = OwnerFactory(stripe_subscription_id=None)
-        assert self.stripe.update_email_address(owner, "test@gmail.com") == None
+        assert self.stripe.update_email_address(owner, "test@gmail.com") is None
 
     @patch("services.billing.stripe.Customer.modify")
     def test_update_email_address(self, modify_customer_mock):
@@ -1240,13 +1149,74 @@ class StripeServiceTests(TestCase):
         self.stripe.update_email_address(owner, "test@gmail.com")
         modify_customer_mock.assert_called_once_with(customer_id, email=email)
 
+    @patch("logging.Logger.error")
+    def test_update_billing_address_with_invalid_address(self, log_error_mock):
+        owner = OwnerFactory(stripe_customer_id="123", stripe_subscription_id="123")
+        assert self.stripe.update_billing_address(owner, "John Doe", "gabagool") is None
+        log_error_mock.assert_called_with(
+            "Unable to update billing address for customer",
+            extra={
+                "customer_id": "123",
+                "subscription_id": "123",
+            },
+        )
+
+    def test_update_billing_address_when_no_customer_id(self):
+        owner = OwnerFactory(stripe_customer_id=None)
+        assert (
+            self.stripe.update_billing_address(
+                owner,
+                name="John Doe",
+                billing_address={
+                    "line1": "45 Fremont St.",
+                    "line2": "",
+                    "city": "San Francisco",
+                    "state": "CA",
+                    "country": "US",
+                    "postal_code": "94105",
+                },
+            )
+            is None
+        )
+
+    @patch("services.billing.stripe.Customer.retrieve")
+    @patch("services.billing.stripe.PaymentMethod.modify")
+    @patch("services.billing.stripe.Customer.modify")
+    def test_update_billing_address(
+        self, modify_customer_mock, modify_payment_mock, retrieve_customer_mock
+    ):
+        subscription_id = "sub_abc"
+        customer_id = "cus_abc"
+        owner = OwnerFactory(
+            stripe_subscription_id=subscription_id, stripe_customer_id=customer_id
+        )
+        billing_address = {
+            "line1": "45 Fremont St.",
+            "line2": "",
+            "city": "San Francisco",
+            "state": "CA",
+            "country": "US",
+            "postal_code": "94105",
+        }
+        self.stripe.update_billing_address(
+            owner,
+            name="John Doe",
+            billing_address=billing_address,
+        )
+
+        retrieve_customer_mock.assert_called_once()
+        modify_payment_mock.assert_called_once()
+        modify_customer_mock.assert_called_once_with(
+            customer_id, address=billing_address
+        )
+
     @patch("services.billing.stripe.Invoice.retrieve")
     def test_get_invoice_not_found(self, retrieve_invoice_mock):
         invoice_id = "abc"
         retrieve_invoice_mock.side_effect = InvalidRequestError(
             message="not found", param=invoice_id
         )
-        assert self.stripe.get_invoice(OwnerFactory(), invoice_id) == None
+        assert self.stripe.get_invoice(OwnerFactory(), invoice_id) is None
         retrieve_invoice_mock.assert_called_once_with(invoice_id)
 
     @patch("services.billing.stripe.Invoice.retrieve")
@@ -1255,7 +1225,7 @@ class StripeServiceTests(TestCase):
         invoice_id = "abc"
         invoice = {"invoice_id": "abc", "customer": "cus_abc"}
         retrieve_invoice_mock.return_value = invoice
-        assert self.stripe.get_invoice(owner, invoice_id) == None
+        assert self.stripe.get_invoice(owner, invoice_id) is None
         retrieve_invoice_mock.assert_called_once_with(invoice_id)
 
     @patch("services.billing.stripe.Invoice.retrieve")
@@ -1278,7 +1248,7 @@ class StripeServiceTests(TestCase):
         owner = OwnerFactory(
             stripe_subscription_id="test-subscription-id",
             stripe_customer_id="test-customer-id",
-            plan="users-inappm",
+            plan="users-pr-inappm",
         )
         self.stripe.apply_cancellation_discount(owner)
 
@@ -1317,7 +1287,7 @@ class StripeServiceTests(TestCase):
 
         assert not customer_modify_mock.called
         assert not coupon_create_mock.called
-        assert owner.stripe_coupon_id == None
+        assert owner.stripe_coupon_id is None
 
     @patch("services.billing.stripe.Coupon.create")
     @patch("services.billing.stripe.Customer.modify")
@@ -1332,7 +1302,7 @@ class StripeServiceTests(TestCase):
 
         assert not customer_modify_mock.called
         assert not coupon_create_mock.called
-        assert owner.stripe_coupon_id == None
+        assert owner.stripe_coupon_id is None
 
     @patch("services.billing.stripe.Coupon.create")
     @patch("services.billing.stripe.Customer.modify")
@@ -1373,6 +1343,9 @@ class MockPaymentService(AbstractPaymentService):
         pass
 
     def update_email_address(self, owner, email_address):
+        pass
+
+    def update_billing_address(self, owner, name, billing_address):
         pass
 
     def get_schedule(self, owner):

@@ -1,4 +1,5 @@
-from typing import List
+import logging
+from typing import List, Optional
 
 import sentry_sdk
 import yaml
@@ -11,7 +12,7 @@ import services.path as path_service
 import services.report as report_service
 from codecov.db import sync_to_async
 from core.models import Commit
-from graphql_api.actions.commits import commit_uploads
+from graphql_api.actions.commits import commit_status, commit_uploads
 from graphql_api.actions.comparison import validate_commit_comparison
 from graphql_api.actions.path_contents import sort_path_contents
 from graphql_api.dataloader.bundle_analysis import (
@@ -27,25 +28,34 @@ from graphql_api.helpers.connection import (
 )
 from graphql_api.types.comparison.comparison import (
     MissingBaseCommit,
-    MissingBaseReport,
     MissingHeadReport,
 )
-from graphql_api.types.enums import OrderingDirection, PathContentDisplayType
+from graphql_api.types.enums import (
+    CommitStatus,
+    OrderingDirection,
+    PathContentDisplayType,
+)
 from graphql_api.types.errors import MissingCoverage, UnknownPath
 from graphql_api.types.errors.errors import UnknownFlags
+from reports.models import CommitReport
 from services.bundle_analysis import BundleAnalysisComparison, BundleAnalysisReport
 from services.comparison import Comparison, ComparisonReport
 from services.components import Component
 from services.path import ReportPaths
 from services.profiling import CriticalFile, ProfilingSummary
 from services.report import ReadOnlyReport
-from services.yaml import YamlStates, get_yaml_state
+from services.yaml import (
+    YamlStates,
+    get_yaml_state,
+)
 
 commit_bindable = ObjectType("Commit")
 
 commit_bindable.set_alias("createdAt", "timestamp")
 commit_bindable.set_alias("pullId", "pullid")
 commit_bindable.set_alias("branchName", "branch")
+
+log = logging.getLogger(__name__)
 
 
 @commit_bindable.field("coverageFile")
@@ -193,6 +203,8 @@ def resolve_bundle_analysis_report(
             "request"
         ].bundle_analysis_head_report_db_path = bundle_analysis_report.report.db_path
 
+    info.context["commit"] = commit
+
     return bundle_analysis_report
 
 
@@ -299,9 +311,9 @@ def resolve_path_contents(commit: Commit, info, path: str = None, filters=None):
 
 
 @commit_bindable.field("errors")
-async def resolve_errors(commit, info, errorType):
+async def resolve_errors(commit, info, error_type):
     command = info.context["executor"].get_command("commit")
-    queryset = await command.get_commit_errors(commit, error_type=errorType)
+    queryset = await command.get_commit_errors(commit, error_type=error_type)
     return await queryset_to_connection(
         queryset,
         ordering=("updated_at",),
@@ -318,9 +330,9 @@ async def resolve_total_uploads(commit, info):
 @commit_bindable.field("components")
 @sync_to_async
 def resolve_components(commit: Commit, info, filters=None) -> List[Component]:
-    request = info.context["request"]
     info.context["component_commit"] = commit
-    all_components = components_service.commit_components(commit, request.user)
+    current_owner = info.context["request"].current_owner
+    all_components = components_service.commit_components(commit, current_owner)
 
     if filters and filters.get("components"):
         return components_service.filter_components_by_name(
@@ -328,3 +340,17 @@ def resolve_components(commit: Commit, info, filters=None) -> List[Component]:
         )
 
     return all_components
+
+
+@sentry_sdk.trace
+@commit_bindable.field("bundleStatus")
+@sync_to_async
+def resolve_bundle_status(commit: Commit, info) -> Optional[CommitStatus]:
+    return commit_status(commit, CommitReport.ReportType.BUNDLE_ANALYSIS)
+
+
+@sentry_sdk.trace
+@commit_bindable.field("coverageStatus")
+@sync_to_async
+def resolve_coverage_status(commit: Commit, info) -> Optional[CommitStatus]:
+    return commit_status(commit, CommitReport.ReportType.COVERAGE)

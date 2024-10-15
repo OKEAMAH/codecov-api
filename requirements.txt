@@ -10,7 +10,7 @@ amqp==5.2.0
     # via kombu
 analytics-python==1.3.0b1
     # via shared
-anyio==4.4.0
+anyio==3.7.1
     # via
     #   httpcore
     #   starlette
@@ -391,7 +391,7 @@ redis==4.4.4
     #   shared
 regex==2023.12.25
     # via -r requirements.in
-requests==2.32.2
+requests==2.31.0
     # via
     #   -r requirements.in
     #   analytics-python
@@ -440,7 +440,7 @@ sqlparse==0.5.0
     # via
     #   ddtrace
     #   django
-starlette==0.36.2
+starlette==0.40.0
     # via ariadne
 statsd==3.3.0
     # via shared
